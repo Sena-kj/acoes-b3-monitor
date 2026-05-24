@@ -1,0 +1,57 @@
+services:
+  monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # Build-time: sem build-args necessarios (todas as vars sao runtime)
+    image: acoes-b3-monitor:latest
+    container_name: acoes-b3-monitor
+    restart: unless-stopped      # 24/7 — reinicia em crash, para em `docker compose down`
+
+    # Todas as vars de configuracao vem do .env (nunca hardcoded aqui)
+    env_file:
+      - .env
+
+    # Injetado explicitamente para garantir mesmo se .env omitir
+    environment:
+      - TZ=America/Sao_Paulo
+      # CRITICO: SQLite DENTRO do volume montado (/app/data), senao restart apaga o DB
+      # e a deduplicacao de noticias/alertas quebra. Nome casa com Settings.db_path (env DB_PATH).
+      - DB_PATH=/app/data/acoes_b3_monitor.db
+
+    volumes:
+      # Volume nomeado persistente para o SQLite (historico de quotes, alertas, dedup de noticias)
+      # CRITICO: sem este volume, restart apaga todo o historico e deduplicacao quebra.
+      - b3_data:/app/data
+
+    # Sem portas expostas — servico e daemon puro, sem HTTP server
+
+    # Healthcheck via saida do processo (APScheduler rodando = processo vivo)
+    # Alternativa: se o app expuser um arquivo /app/data/.healthy, trocar pelo check de arquivo
+    healthcheck:
+      test: ["CMD", "python", "-c", "import acoes_b3_monitor; print('ok')"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+    # Limites de recursos (ajustar conforme VPS)
+    # 256 MB RAM e suficiente para APScheduler + httpx + SQLite
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 64M
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  b3_data:
+    # Volume nomeado Docker — persiste entre restarts e `docker compose up --build`
+    # Para backup: `docker run --rm -v b3_data:/data -v $(pwd):/backup alpine tar czf /backup/b3_data.tar.gz /data`
+    driver: local

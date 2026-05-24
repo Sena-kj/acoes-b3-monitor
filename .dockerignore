@@ -1,0 +1,45 @@
+# Secrets — NUNCA entrar na imagem
+.env
+.env.*
+!.env.example
+
+# Git
+.git
+.gitignore
+
+# Python artifacts
+__pycache__
+*.py[cod]
+*.pyo
+*.pyd
+.venv
+venv
+*.egg-info
+.pytest_cache
+.ruff_cache
+.mypy_cache
+dist
+build
+
+# Dados locais — nao faz parte da imagem (persistido via volume)
+*.db
+*.sqlite
+*.sqlite3
+data/
+*.zip
+
+# Testes e documentacao de dev (nao necessarios no container de producao)
+tests/
+coordination/
+graphify-out/
+
+# IDE / OS
+.DS_Store
+Thumbs.db
+.vscode
+.idea
+*.swp
+*~
+
+# Logs locais
+*.log
