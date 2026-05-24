@@ -160,12 +160,18 @@ def get_settings() -> Settings:
 
 
 def get_db_path() -> str:
-    """Retorna caminho do SQLite, lido do env sem passar por Settings."""
+    """Retorna caminho do SQLite. Le de _EnvSettings diretamente (nao faz parte de Settings)."""
+    # Nota: db_path nao e exposto via Settings (nao e campo do contrato de tipos),
+    # por isso instanciamos _EnvSettings aqui. get_settings() tem @lru_cache mas
+    # Settings nao carrega db_path — manter separado e intencional.
     env = _EnvSettings()
     return env.db_path
 
 
 def get_anthropic_model() -> str:
-    """Retorna modelo Anthropic configurado."""
+    """Retorna modelo Anthropic configurado. Usa cache de get_settings() quando disponivel."""
+    # anthropic_model nao e campo de Settings (nao esta no contrato), mas podemos
+    # reaproveitar a instancia cacheada de _EnvSettings via get_settings() se precisar.
+    # Para nao alterar o contrato de Settings, mantemos _EnvSettings direto aqui.
     env = _EnvSettings()
     return env.anthropic_model

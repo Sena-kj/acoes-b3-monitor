@@ -175,3 +175,172 @@ async def test_ca08_guid_unique_in_storage(news_item_vale3: NewsItem, tmp_db: st
 
     vale3_items = [i for i in items if news_item_vale3.guid == i.guid]
     assert len(vale3_items) == 1, f"Esperado 1, encontrado {len(vale3_items)} itens com mesmo guid"
+
+
+# ---------------------------------------------------------------------------
+# Testes de seguranca — SSRF, zip-slip, XML malicioso (XXE/Billion Laughs)
+# ---------------------------------------------------------------------------
+
+import pytest
+
+@pytest.mark.parametrize("bad_url", [
+    "http://169.254.169.254/latest/meta-data/",       # AWS IMDS — link-local
+    "https://169.254.169.254/latest/meta-data/",      # IMDS com https
+    "https://127.0.0.1/redis",                         # loopback IPv4
+    "https://localhost/internal",                      # loopback hostname
+    "https://10.0.0.1/postgres",                       # RFC1918 classe A
+    "https://192.168.1.1/router",                      # RFC1918 classe C
+    "https://172.16.0.1/internal",                     # RFC1918 classe B
+    "http://169.254.0.1/",                             # link-local generico
+    "ftp://example.com/file",                          # esquema nao permitido
+])
+def test_ssrf_validate_resolved_url_rejects_private(bad_url: str) -> None:
+    """SEC-ALTA: _validate_resolved_url deve rejeitar IPs privados, loopback e link-local."""
+    from acoes_b3_monitor.news_collector import _validate_resolved_url
+
+    with pytest.raises(ValueError):
+        _validate_resolved_url(bad_url)
+
+
+def test_ssrf_validate_resolved_url_accepts_public() -> None:
+    """SEC-ALTA: _validate_resolved_url deve aceitar URL publica valida."""
+    from acoes_b3_monitor.news_collector import _validate_resolved_url
+
+    # Nao deve levantar excecao
+    _validate_resolved_url("https://www.infomoney.com.br/noticias/petr4-dividendos")
+    _validate_resolved_url("https://moneytimes.com.br/artigo/123")
+
+
+@pytest.mark.asyncio
+async def test_ssrf_resolve_google_redirect_rejects_private_host(tmp_db: str) -> None:
+    """
+    SEC-ALTA: _resolve_google_redirect deve retornar a URL original do Google
+    quando o redirect apontar para IP privado/loopback (SSRF guard).
+    """
+    import respx
+    import httpx
+    from acoes_b3_monitor.news_collector import _resolve_google_redirect
+
+    google_url = "https://news.google.com/rss/articles/CBMiXmh0dHBzOi8vd3d3LmluZm9tb25leS5jb20uYnIvbm90aWNpYXMv"
+
+    with respx.mock:
+        # Simula redirect para IP de IMDS (ataque SSRF)
+        respx.head(google_url).mock(
+            return_value=httpx.Response(
+                301,
+                headers={"location": "https://169.254.169.254/latest/meta-data/"},
+            )
+        )
+        respx.get(google_url).mock(
+            return_value=httpx.Response(
+                301,
+                headers={"location": "https://169.254.169.254/latest/meta-data/"},
+            )
+        )
+        # O SSRF guard deve bloquear; funcao retorna URL original
+        result = await _resolve_google_redirect(google_url, None)  # type: ignore[arg-type]
+
+    assert result == google_url, (
+        f"Esperado URL original do Google, obteve: {result!r}"
+    )
+
+
+def test_zip_slip_rejected(tmp_path) -> None:
+    """
+    SEC-MEDIA: fetch_cvm_ipe deve rejeitar ZIP com nome de membro contendo '..'
+    (path traversal / zip-slip).
+    """
+    import io
+    import zipfile
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    # Cria ZIP com nome malicioso
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("../../etc/cron.d/backdoor.csv", "Categoria;Protocolo_Entrega\n")
+    buf.seek(0)
+    zip_bytes = buf.read()
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.content = zip_bytes
+    mock_resp.headers = {"content-length": str(len(zip_bytes))}
+    mock_resp.raise_for_status = MagicMock()
+
+    mock_head_resp = MagicMock()
+    mock_head_resp.headers = {"content-length": str(len(zip_bytes))}
+    mock_head_resp.raise_for_status = MagicMock()
+
+    async def mock_get(*args, **kwargs):
+        return mock_resp
+
+    async def mock_head(*args, **kwargs):
+        return mock_head_resp
+
+    import asyncio
+    from acoes_b3_monitor.news_collector import fetch_cvm_ipe
+
+    async def run():
+        mock_client = MagicMock()
+        mock_client.head = mock_head
+        mock_client.get = mock_get
+        return await fetch_cvm_ipe(["VALE3"], ":memory:", mock_client)
+
+    result = asyncio.get_event_loop().run_until_complete(run())
+    assert result == [], "ZIP com zip-slip deve retornar lista vazia"
+
+
+def test_xml_billion_laughs_does_not_explode() -> None:
+    """
+    SEC-MEDIA: feedparser nao deve explodir (OOM/hang) com XML billion-laughs.
+    Verifica que a biblioteca tem protecao basica contra entity expansion.
+    Estrategia: parse com timeout implicito e verificar que retorna sem crash
+    (feedparser 6.x usa xml.etree.ElementTree que ja limita expansao de entidades).
+    """
+    import feedparser
+
+    # Billion Laughs clássico (10 niveis de expansao)
+    billion_laughs_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE foo [
+  <!ENTITY lol "lol">
+  <!ENTITY lol2 "&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;">
+  <!ENTITY lol3 "&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;">
+  <!ENTITY lol4 "&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;">
+]>
+<rss version="2.0">
+  <channel>
+    <title>&lol4;</title>
+    <item><title>Test</title><link>https://example.com</link></item>
+  </channel>
+</rss>"""
+
+    # Deve retornar sem crash (feedparser captura erros de parse internamente)
+    result = feedparser.parse(billion_laughs_xml)
+    # Nao importa se parseia ou nao — o importante e nao travar/crashar
+    assert hasattr(result, "entries"), "feedparser deve retornar objeto FeedParserDict mesmo com XML malicioso"
+
+
+def test_xml_external_entity_does_not_leak() -> None:
+    """
+    SEC-MEDIA: feedparser nao deve processar entidades externas (XXE).
+    Um XML com entidade externa para /etc/passwd nao deve causar leitura de arquivo.
+    """
+    import feedparser
+
+    xxe_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE foo [
+  <!ENTITY xxe SYSTEM "file:///etc/passwd">
+]>
+<rss version="2.0">
+  <channel>
+    <title>&xxe;</title>
+    <item><title>Test</title><link>https://example.com</link></item>
+  </channel>
+</rss>"""
+
+    result = feedparser.parse(xxe_xml)
+    # O titulo nao deve conter conteudo do /etc/passwd (root: ou similares)
+    title = ""
+    if result.feed:
+        title = result.feed.get("title", "")
+    assert "root:" not in title, f"XXE possivelmente explorado: title={title!r}"

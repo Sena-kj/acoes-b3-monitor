@@ -148,7 +148,8 @@ async def send_message(text: str, settings: Settings) -> None:
 
             if resp.status_code == 400:
                 data = resp.json()
-                logger.error("Telegram 400: %s — payload: %s", data, payload)
+                # Nao loga payload — o token Telegram esta na URL/body e pode vazar em logs
+                logger.error("Telegram 400: %s", data)
                 raise RuntimeError(f"Telegram bad request: {data.get('description', 'unknown')}")
 
             resp.raise_for_status()

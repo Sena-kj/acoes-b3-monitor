@@ -15,12 +15,15 @@ from __future__ import annotations
 
 import html
 import io
+import ipaddress
 import logging
 import re
+import socket
 import zipfile
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any
+from urllib.parse import urlparse
 
 import feedparser
 import httpx
@@ -33,6 +36,46 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_USER_AGENT = "Mozilla/5.0 (compatible; acoes-b3-monitor/1.0)"
 CVM_BASE_URL = "https://dados.cvm.gov.br/dados/CIA_ABERTA/DOC/IPE/DADOS"
+
+_CVM_ZIP_MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024   # 50 MB
+_CVM_ZIP_MAX_MEMBER_BYTES = 100 * 1024 * 1024     # 100 MB
+
+
+def _is_private_host(hostname: str) -> bool:
+    """
+    Retorna True se o hostname resolve para IP privado, loopback ou link-local.
+    Rejeita IPs RFC1918, 127.0.0.0/8, 169.254.0.0/16 (incl. IMDS) e ::1.
+    """
+    try:
+        addr = ipaddress.ip_address(hostname)
+        return addr.is_private or addr.is_loopback or addr.is_link_local
+    except ValueError:
+        pass  # hostname nao e IP literal; resolve via DNS
+
+    try:
+        resolved_ip = socket.getaddrinfo(hostname, None)[0][4][0]
+        addr = ipaddress.ip_address(resolved_ip)
+        return addr.is_private or addr.is_loopback or addr.is_link_local
+    except Exception:
+        return True  # em caso de falha de resolucao, rejeita por precaucao
+
+
+def _validate_resolved_url(url: str) -> None:
+    """
+    Valida que a URL resolvida e segura:
+    - esquema deve ser https
+    - hostname nao pode resolver para IP privado/loopback/link-local
+
+    Levanta ValueError se qualquer condicao for violada.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme != "https":
+        raise ValueError(f"SSRF guard: esquema nao permitido '{parsed.scheme}' em URL resolvida: {url!r}")
+    hostname = parsed.hostname or ""
+    if not hostname:
+        raise ValueError(f"SSRF guard: hostname vazio em URL resolvida: {url!r}")
+    if _is_private_host(hostname):
+        raise ValueError(f"SSRF guard: hostname '{hostname}' resolve para IP interno em URL resolvida: {url!r}")
 
 # Mapeamento ticker -> queries InfoMoney por keyword
 TICKER_TO_INFOMONEY_KEYWORD: dict[str, str] = {
@@ -176,22 +219,34 @@ async def _fetch_moneytimes(tickers: list[str], client: httpx.AsyncClient) -> li
     return items
 
 
-async def _resolve_google_redirect(url: str, client: httpx.AsyncClient) -> str:
+async def _resolve_google_redirect(url: str, _client: httpx.AsyncClient) -> str:
     """
     Segue redirect do Google News para obter URL real do artigo.
-    Se falhar, retorna a URL original (nunca bloqueia o fluxo).
+    Usa cliente httpx isolado (sem headers compartilhados) para evitar vazamento
+    de headers em redirect (ver pitfall httpx-custom-header-forwarded-on-redirect).
+    Valida esquema https e que host nao e IP interno (SSRF guard).
+    Se falhar ou a URL resolvida nao passar na validacao, retorna a URL original.
     """
     if "news.google.com" not in url:
         return url
     try:
-        resp = await client.head(url, follow_redirects=True, timeout=5.0)
-        final_url = str(resp.url)
-        if "news.google.com" not in final_url:
-            return final_url
-        # Tenta GET se HEAD nao resolver
-        resp2 = await client.get(url, follow_redirects=True, timeout=5.0)
-        final_url2 = str(resp2.url)
-        return final_url2 if "news.google.com" not in final_url2 else url
+        # Cliente isolado — sem headers de auth que possam vazar em cross-host redirect
+        async with httpx.AsyncClient(timeout=5.0, follow_redirects=True) as resolve_client:
+            resp = await resolve_client.head(url)
+            final_url = str(resp.url)
+            if "news.google.com" not in final_url:
+                _validate_resolved_url(final_url)
+                return final_url
+            # HEAD nao resolveu; tenta GET
+            resp2 = await resolve_client.get(url)
+            final_url2 = str(resp2.url)
+            if "news.google.com" not in final_url2:
+                _validate_resolved_url(final_url2)
+                return final_url2
+        return url
+    except ValueError as e:
+        logger.warning("SSRF guard rejeitou URL resolvida de Google News: %s", e)
+        return url
     except Exception:
         return url
 
@@ -247,6 +302,11 @@ async def fetch_cvm_ipe(tickers: list[str], db_path: str, client: httpx.AsyncCli
     Baixa o ZIP CVM IPE do ano corrente, parseia CSV latin-1,
     filtra Fatos Relevantes das empresas monitoradas.
     Dedup por Protocolo_Entrega (marca no storage para evitar re-notificar).
+
+    Protecoes de seguranca:
+    - Rejeita se Content-Length > 50 MB antes de baixar
+    - Rejeita nome de membro ZIP com '..' ou path absoluto (zip-slip)
+    - Rejeita membro com file_size descompactado > 100 MB
     """
     import csv
     from datetime import date
@@ -256,10 +316,35 @@ async def fetch_cvm_ipe(tickers: list[str], db_path: str, client: httpx.AsyncCli
     zip_url = f"{CVM_BASE_URL}/{zip_filename}"
 
     try:
+        # HEAD para checar Content-Length antes de baixar
+        head_resp = await client.head(zip_url, timeout=15.0)
+        content_length_str = head_resp.headers.get("content-length", "")
+        if content_length_str:
+            try:
+                content_length = int(content_length_str)
+                if content_length > _CVM_ZIP_MAX_DOWNLOAD_BYTES:
+                    logger.warning(
+                        "CVM IPE: ZIP recusado — Content-Length %d > limite %d bytes",
+                        content_length,
+                        _CVM_ZIP_MAX_DOWNLOAD_BYTES,
+                    )
+                    return []
+            except ValueError:
+                pass
+
         resp = await client.get(zip_url, timeout=60.0)
         resp.raise_for_status()
     except Exception as e:
         logger.warning("Erro ao baixar CVM IPE %s: %s", zip_url, e)
+        return []
+
+    # Verificacao pos-download do tamanho real
+    if len(resp.content) > _CVM_ZIP_MAX_DOWNLOAD_BYTES:
+        logger.warning(
+            "CVM IPE: ZIP recusado pos-download — %d bytes > limite %d bytes",
+            len(resp.content),
+            _CVM_ZIP_MAX_DOWNLOAD_BYTES,
+        )
         return []
 
     items: list[NewsItem] = []
@@ -272,63 +357,84 @@ async def fetch_cvm_ipe(tickers: list[str], db_path: str, client: httpx.AsyncCli
                 logger.warning("CVM IPE: ZIP sem CSV")
                 return []
 
-            with zf.open(csv_names[0]) as f:
+            csv_entry_name = csv_names[0]
+
+            # Protecao zip-slip: rejeita nomes com '..' ou path absoluto
+            if ".." in csv_entry_name or csv_entry_name.startswith("/"):
+                logger.error(
+                    "CVM IPE: nome de membro ZIP suspeito (zip-slip): %r", csv_entry_name
+                )
+                return []
+
+            # Verifica tamanho descompactado antes de ler
+            info = zf.getinfo(csv_entry_name)
+            if info.file_size > _CVM_ZIP_MAX_MEMBER_BYTES:
+                logger.error(
+                    "CVM IPE: membro ZIP recusado — file_size descompactado %d > limite %d bytes",
+                    info.file_size,
+                    _CVM_ZIP_MAX_MEMBER_BYTES,
+                )
+                return []
+
+            with zf.open(csv_entry_name) as f:
                 # CSV e latin-1 com delimitador ;
                 content = f.read().decode("latin-1", errors="replace")
-                reader = csv.DictReader(io.StringIO(content), delimiter=";")
 
-                for row in reader:
-                    categoria = row.get("Categoria", "").strip()
-                    if categoria != "Fato Relevante":
-                        continue
+        # Fecha o ZIP antes de fazer awaits (mistura de I/O sincrono e assincrono)
+        reader = csv.DictReader(io.StringIO(content), delimiter=";")
 
-                    protocolo = row.get("Protocolo_Entrega", "").strip()
-                    if not protocolo:
-                        continue
+        for row in reader:
+            categoria = row.get("Categoria", "").strip()
+            if categoria != "Fato Relevante":
+                continue
 
-                    # Verifica se ja foi processado
-                    if await is_cvm_protocol_seen(protocolo, db_path):
-                        continue
+            protocolo = row.get("Protocolo_Entrega", "").strip()
+            if not protocolo:
+                continue
 
-                    nome_companhia = row.get("Nome_Companhia", "").upper()
-                    related_tickers = [
-                        t for t, cn in company_names.items()
-                        if cn and cn in nome_companhia
-                    ]
-                    if not related_tickers:
-                        # Marca como visto mesmo sem ticker relacionado (evita reprocessar)
-                        await mark_cvm_protocol_seen(protocolo, db_path)
-                        continue
+            # Verifica se ja foi processado
+            if await is_cvm_protocol_seen(protocolo, db_path):
+                continue
 
-                    assunto = row.get("Assunto", "").strip()
-                    data_entrega_str = row.get("Data_Entrega", "").strip()
-                    link_download = row.get("Link_Download", "").strip()
+            nome_companhia = row.get("Nome_Companhia", "").upper()
+            related_tickers = [
+                t for t, cn in company_names.items()
+                if cn and cn in nome_companhia
+            ]
+            if not related_tickers:
+                # Marca como visto mesmo sem ticker relacionado (evita reprocessar)
+                await mark_cvm_protocol_seen(protocolo, db_path)
+                continue
 
-                    try:
-                        # Data no formato YYYY-MM-DD
-                        data_entrega = datetime.strptime(data_entrega_str, "%Y-%m-%d").replace(
-                            tzinfo=timezone.utc
-                        )
-                    except ValueError:
-                        data_entrega = datetime.now(tz=timezone.utc)
+            assunto = row.get("Assunto", "").strip()
+            data_entrega_str = row.get("Data_Entrega", "").strip()
+            link_download = row.get("Link_Download", "").strip()
 
-                    guid = f"cvm_ipe:{protocolo}"
-                    await mark_cvm_protocol_seen(protocolo, db_path)
+            try:
+                # Data no formato YYYY-MM-DD
+                data_entrega = datetime.strptime(data_entrega_str, "%Y-%m-%d").replace(
+                    tzinfo=timezone.utc
+                )
+            except ValueError:
+                data_entrega = datetime.now(tz=timezone.utc)
 
-                    items.append(
-                        NewsItem(
-                            guid=guid,
-                            title=assunto or f"Fato Relevante — {nome_companhia}",
-                            source=NewsSource.CVM_IPE,
-                            published_at=data_entrega,
-                            url=link_download or zip_url,
-                            tickers=related_tickers,
-                            body=None,
-                            cvm_protocolo=protocolo,
-                            cvm_link_download=link_download or None,
-                            encoding_source="latin-1",
-                        )
-                    )
+            guid = f"cvm_ipe:{protocolo}"
+            await mark_cvm_protocol_seen(protocolo, db_path)
+
+            items.append(
+                NewsItem(
+                    guid=guid,
+                    title=assunto or f"Fato Relevante — {nome_companhia}",
+                    source=NewsSource.CVM_IPE,
+                    published_at=data_entrega,
+                    url=link_download or zip_url,
+                    tickers=related_tickers,
+                    body=None,
+                    cvm_protocolo=protocolo,
+                    cvm_link_download=link_download or None,
+                    encoding_source="latin-1",
+                )
+            )
     except Exception as e:
         logger.error("Erro ao parsear CVM IPE: %s", e)
 

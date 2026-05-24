@@ -26,6 +26,19 @@ from .types import NewsAnalysis, NewsItem, Sentiment, Settings
 
 logger = logging.getLogger(__name__)
 
+# Cliente AsyncAnthropic reutilizado (module-level lazy) — evita criar um cliente por NewsItem
+# e nao bloqueia o event loop (AsyncAnthropic usa httpx async internamente).
+_async_client: anthropic.AsyncAnthropic | None = None
+
+
+def _get_async_client(api_key: str) -> anthropic.AsyncAnthropic:
+    """Retorna instancia lazy de AsyncAnthropic (singleton por processo)."""
+    global _async_client
+    if _async_client is None:
+        _async_client = anthropic.AsyncAnthropic(api_key=api_key)
+    return _async_client
+
+
 # System prompt fixo — candidato a cache (mesmo conteudo repetido a cada chamada)
 _SYSTEM_PROMPT = """Voce e um analista de noticias financeiras especializado em empresas brasileiras listadas na B3.
 
@@ -74,7 +87,7 @@ async def analyze(
     Loga tokens consumidos por chamada.
     """
     model_name = model or get_anthropic_model()
-    client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+    client = _get_async_client(settings.anthropic_api_key)
 
     # Monta o conteudo da noticia para o user message
     ticker_str = ", ".join(item.tickers) if item.tickers else "N/A"
@@ -85,7 +98,7 @@ async def analyze(
 
     try:
         # Usa prompt caching no system prompt (bloco fixo repetido a cada chamada)
-        response = client.messages.create(
+        response = await client.messages.create(
             model=model_name,
             max_tokens=_MAX_TOKENS,
             system=[

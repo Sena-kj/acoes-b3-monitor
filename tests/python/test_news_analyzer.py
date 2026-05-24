@@ -4,14 +4,14 @@ Testes CA-09 — news_analyzer.
 CA-09: analyze(item) retorna NewsAnalysis com:
   - sentiment em {POSITIVO, NEUTRO, NEGATIVO}
   - summary com 1-4 frases (string nao vazia)
-  - NÃO contem previsao de preco, ganho/perda ou recomendacao (verificacao manual QA)
+  - NAO contem previsao de preco, ganho/perda ou recomendacao (verificacao manual QA)
 """
 
 from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -20,7 +20,7 @@ from acoes_b3_monitor.types import NewsAnalysis, NewsItem, Sentiment
 
 
 # ---------------------------------------------------------------------------
-# Helpers para mock do SDK Anthropic
+# Helpers para mock do SDK Anthropic (AsyncAnthropic)
 # ---------------------------------------------------------------------------
 
 def _make_anthropic_response(sentiment: str, summary: str) -> MagicMock:
@@ -43,6 +43,17 @@ def _make_anthropic_response(sentiment: str, summary: str) -> MagicMock:
     return mock_response
 
 
+def _patch_async_client(mock_response: MagicMock):
+    """
+    Contexto que substitui o cliente lazy de AsyncAnthropic pelo mock.
+    Patcha acoes_b3_monitor.news_analyzer._async_client com cliente cujo
+    messages.create e AsyncMock retornando mock_response.
+    """
+    mock_client = MagicMock()
+    mock_client.messages.create = AsyncMock(return_value=mock_response)
+    return patch("acoes_b3_monitor.news_analyzer._async_client", mock_client)
+
+
 # ---------------------------------------------------------------------------
 # Testes
 # ---------------------------------------------------------------------------
@@ -58,11 +69,7 @@ async def test_ca09_analyze_returns_valid_sentiment(
         "Vale interrompeu operacoes em uma mina de MG por motivo tecnico. O incidente pode afetar volumes de producao.",
     )
 
-    with patch("acoes_b3_monitor.news_analyzer.anthropic.Anthropic") as mock_anthropic_cls:
-        mock_client = MagicMock()
-        mock_client.messages.create.return_value = mock_response
-        mock_anthropic_cls.return_value = mock_client
-
+    with _patch_async_client(mock_response):
         analysis = await analyze(news_item_vale3, settings)
 
     assert analysis.sentiment in {Sentiment.POSITIVO, Sentiment.NEUTRO, Sentiment.NEGATIVO}
@@ -80,11 +87,7 @@ async def test_ca09_analyze_summary_not_empty(
         "A empresa reportou incidente operacional. Os detalhes ainda estao sendo apurados.",
     )
 
-    with patch("acoes_b3_monitor.news_analyzer.anthropic.Anthropic") as mock_anthropic_cls:
-        mock_client = MagicMock()
-        mock_client.messages.create.return_value = mock_response
-        mock_anthropic_cls.return_value = mock_client
-
+    with _patch_async_client(mock_response):
         analysis = await analyze(news_item_vale3, settings)
 
     assert isinstance(analysis.summary, str)
@@ -102,11 +105,7 @@ async def test_ca09_analyze_tokens_logged(
 
     mock_response = _make_anthropic_response("POSITIVO", "Noticia positiva para a empresa.")
 
-    with patch("acoes_b3_monitor.news_analyzer.anthropic.Anthropic") as mock_anthropic_cls:
-        mock_client = MagicMock()
-        mock_client.messages.create.return_value = mock_response
-        mock_anthropic_cls.return_value = mock_client
-
+    with _patch_async_client(mock_response):
         with caplog.at_level(logging.INFO, logger="acoes_b3_monitor.news_analyzer"):
             analysis = await analyze(news_item_vale3, settings)
 
@@ -127,11 +126,7 @@ async def test_ca09_analyze_returns_newsanalysis_fields(
     """CA-09: NewsAnalysis deve ter todos os campos obrigatorios."""
     mock_response = _make_anthropic_response("NEUTRO", "Analise de rotina sem impacto imediato.")
 
-    with patch("acoes_b3_monitor.news_analyzer.anthropic.Anthropic") as mock_anthropic_cls:
-        mock_client = MagicMock()
-        mock_client.messages.create.return_value = mock_response
-        mock_anthropic_cls.return_value = mock_client
-
+    with _patch_async_client(mock_response):
         analysis = await analyze(news_item_vale3, settings)
 
     assert isinstance(analysis, NewsAnalysis)
@@ -149,11 +144,7 @@ async def test_ca09_analyze_invalid_sentiment_fallback(
     """CA-09: Sentimento invalido da API deve fazer fallback para NEUTRO."""
     mock_response = _make_anthropic_response("INCERTO", "Situacao ambigua.")
 
-    with patch("acoes_b3_monitor.news_analyzer.anthropic.Anthropic") as mock_anthropic_cls:
-        mock_client = MagicMock()
-        mock_client.messages.create.return_value = mock_response
-        mock_anthropic_cls.return_value = mock_client
-
+    with _patch_async_client(mock_response):
         analysis = await analyze(news_item_vale3, settings)
 
     assert analysis.sentiment == Sentiment.NEUTRO

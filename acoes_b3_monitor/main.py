@@ -64,6 +64,26 @@ def create_scheduler():
     return _SafeScheduler(_create())
 
 
+def _validate_secrets(settings) -> None:
+    """
+    Valida que secrets obrigatorios estao presentes no startup.
+    Chamada apenas em _run() (caminho de execucao real), nao em create_scheduler()
+    — o smoke gate CA-12 deve continuar passando sem .env.
+    """
+    missing = []
+    if not settings.anthropic_api_key:
+        missing.append("ANTHROPIC_API_KEY")
+    if not settings.telegram_bot_token:
+        missing.append("TELEGRAM_BOT_TOKEN")
+    if not settings.telegram_chat_id:
+        missing.append("TELEGRAM_CHAT_ID")
+    if missing:
+        raise RuntimeError(
+            f"Secrets obrigatorios ausentes ou vazios: {', '.join(missing)}. "
+            "Defina as variaveis de ambiente antes de iniciar o servico."
+        )
+
+
 async def _run() -> None:
     """Loop principal: inicia scheduler e aguarda SIGINT/SIGTERM."""
     from .config import get_db_path, get_settings
@@ -72,13 +92,17 @@ async def _run() -> None:
     settings = get_settings()
     db_path = get_db_path()
 
+    # Fail-fast: verifica secrets antes de iniciar o scheduler
+    _validate_secrets(settings)
+
     logger.info("acoes-b3-monitor iniciando. Tickers: %s", settings.tickers)
 
     # Inicializa o banco antes de subir o scheduler
     await init_db(db_path)
     logger.info("Storage inicializado em %s", db_path)
 
-    scheduler = create_scheduler(settings, db_path)
+    from .scheduler import create_scheduler as _create_scheduler
+    scheduler = _SafeScheduler(_create_scheduler(settings, db_path))
     scheduler.start()
     logger.info("Scheduler iniciado com %d jobs", len(scheduler.get_jobs()))
 

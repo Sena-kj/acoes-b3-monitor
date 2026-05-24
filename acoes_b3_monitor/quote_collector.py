@@ -107,13 +107,7 @@ class BrapiProvider:
                 delay_minutes=max(0.0, delay_minutes),
                 currency=item.get("currency", "BRL"),
             )
-            logger.info(
-                "Quote %s: R$ %.2f (%.2f%%) delay=%.1fmin",
-                q.symbol,
-                q.price,
-                q.change_pct,
-                q.delay_minutes,
-            )
+            # Log removido daqui — a facade fetch_quotes ja loga delay por ticker (CODE-H2)
             quotes.append(q)
 
         return quotes

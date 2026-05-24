@@ -18,6 +18,7 @@ import anthropic
 import pytz
 
 from .config import get_anthropic_model
+from .news_analyzer import _get_async_client
 from .types import DailyBriefing, NewsAnalysis, Quote, Sentiment, Settings
 
 logger = logging.getLogger(__name__)
@@ -43,7 +44,7 @@ async def _generate_summary(
 ) -> str:
     """Gera resumo do dia via Claude. Usa prompt caching no system prompt."""
     model_name = get_anthropic_model()
-    client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+    client = _get_async_client(settings.anthropic_api_key)
 
     # Monta payload de contexto para o modelo
     context: dict = {
@@ -68,7 +69,7 @@ async def _generate_summary(
     user_content = f"Dados da carteira:\n{json.dumps(context, ensure_ascii=False, indent=2)}"
 
     try:
-        response = client.messages.create(
+        response = await client.messages.create(
             model=model_name,
             max_tokens=256,
             system=[

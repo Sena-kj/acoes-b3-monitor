@@ -87,17 +87,17 @@ async def test_ca10_briefing_summary_with_mock(
     settings,
 ) -> None:
     """CA-10: summary e gerado pelo Claude (mockado aqui)."""
-    from unittest.mock import MagicMock, patch
+    from unittest.mock import AsyncMock, MagicMock, patch
 
     mock_response = MagicMock()
     mock_response.content = [MagicMock(text="Mercado volatil. VALE3 reportou incidente operacional. Carteira em cautela.")]
     mock_response.usage = MagicMock(input_tokens=100, output_tokens=30)
 
-    with patch("acoes_b3_monitor.briefing_builder.anthropic.Anthropic") as mock_cls:
-        mock_client = MagicMock()
-        mock_client.messages.create.return_value = mock_response
-        mock_cls.return_value = mock_client
+    # Patcha o cliente lazy compartilhado (AsyncAnthropic reutilizado)
+    mock_client = MagicMock()
+    mock_client.messages.create = AsyncMock(return_value=mock_response)
 
+    with patch("acoes_b3_monitor.news_analyzer._async_client", mock_client):
         briefing = await build(
             [quote_vale3],
             {"VALE3": [news_analysis_vale3]},
