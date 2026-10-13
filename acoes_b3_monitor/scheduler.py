@@ -10,7 +10,7 @@ Jobs:
 Funcao principal:
   create_scheduler(settings, db_path) -> AsyncIOScheduler
 
-Padrão: apscheduler-fastapi-lifespan (vault).
+Padrao: APScheduler AsyncIOScheduler com timezone BRT explicito.
 """
 
 from __future__ import annotations

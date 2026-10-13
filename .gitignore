@@ -18,8 +18,16 @@ venv/
 *.sqlite
 *.sqlite3
 data/
-*.zip          # ZIPs do CVM IPE baixados
+# ZIPs do CVM IPE baixados
+*.zip
 
 # OS
 .DS_Store
 Thumbs.db
+
+# Processo interno (relatorios de review/QA ficam locais)
+coordination/
+
+# Node / build (caso aparecam)
+node_modules/
+dist/
